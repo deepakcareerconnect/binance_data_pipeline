@@ -1,0 +1,14 @@
+binance:
+  base_url: "https://api.binance.com"
+  endpoint: "/api/v3/klines"
+
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+
+  interval: "1m"
+  limit: 100
+
+s3:
+  landing_prefix: "landing/rest/klines"
