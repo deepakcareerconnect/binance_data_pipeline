@@ -12,61 +12,139 @@ def validate_kline_response(
     symbol: str
 ) -> bool:
 
-    # Check that response is a list
+    # --------------------------------------------------
+    # 1. Response must be a list
+    # --------------------------------------------------
+
     if not isinstance(data, list):
+
         raise ValueError(
             f"Invalid response for {symbol}: "
-            f"expected list, got {type(data).__name__}"
+            f"expected list"
         )
 
-    # Check that response contains data
-    if len(data) == 0:
+    # --------------------------------------------------
+    # 2. Response cannot be empty
+    # --------------------------------------------------
+
+    if not data:
+
         raise ValueError(
-            f"No kline data returned for {symbol}"
+            f"Empty kline response for {symbol}"
         )
 
-    # Validate every kline record
+    # --------------------------------------------------
+    # 3. Validate each candle
+    # --------------------------------------------------
+
+    previous_open_time = None
+
     for index, record in enumerate(data):
 
-        # Each record should be a list
         if not isinstance(record, list):
+
             raise ValueError(
-                f"Invalid kline record at index {index}"
+                f"Record {index} is not a list"
             )
 
-        # Binance kline contains 12 fields
+        # Binance returns 12 fields
         if len(record) != EXPECTED_KLINE_FIELDS:
+
             raise ValueError(
-                f"Invalid kline record at index {index}: "
-                f"expected {EXPECTED_KLINE_FIELDS} fields, "
+                f"Record {index}: expected "
+                f"{EXPECTED_KLINE_FIELDS} fields, "
                 f"received {len(record)}"
             )
 
         open_time = record[0]
         close_time = record[6]
 
-        # Validate timestamps
+        open_price = record[1]
+        high_price = record[2]
+        low_price = record[3]
+        close_price = record[4]
+        volume = record[5]
+
+        # --------------------------------------------------
+        # Timestamp validation
+        # --------------------------------------------------
+
         if not isinstance(open_time, int):
+
             raise ValueError(
-                f"Invalid open time at index {index}: "
-                f"{open_time}"
+                f"Record {index}: invalid open_time"
             )
 
         if not isinstance(close_time, int):
+
             raise ValueError(
-                f"Invalid close time at index {index}: "
-                f"{close_time}"
+                f"Record {index}: invalid close_time"
             )
 
-        # Close time shouldn't be before open time
         if close_time < open_time:
+
             raise ValueError(
-                f"Invalid timestamps at index {index}: "
+                f"Record {index}: "
                 f"close_time < open_time"
             )
 
+        # --------------------------------------------------
+        # Ensure chronological order
+        # --------------------------------------------------
+
+        if (
+            previous_open_time is not None
+            and open_time <= previous_open_time
+        ):
+
+            raise ValueError(
+                f"Record {index}: "
+                f"timestamps are not increasing"
+            )
+
+        previous_open_time = open_time
+
+        # --------------------------------------------------
+        # Price validation
+        # --------------------------------------------------
+
+        try:
+
+            open_price = float(open_price)
+            high_price = float(high_price)
+            low_price = float(low_price)
+            close_price = float(close_price)
+            volume = float(volume)
+
+        except (TypeError, ValueError):
+
+            raise ValueError(
+                f"Record {index}: "
+                f"invalid numeric values"
+            )
+
+        if min(
+            open_price,
+            high_price,
+            low_price,
+            close_price
+        ) < 0:
+
+            raise ValueError(
+                f"Record {index}: "
+                f"negative price detected"
+            )
+
+        if volume < 0:
+
+            raise ValueError(
+                f"Record {index}: "
+                f"negative volume detected"
+            )
+
     logger.info(
-        "Validation successful: symbol=%s records=%s",
+        "Validation successful | "
+        "symbol=%s | records=%s",
         symbol,
         len(data)
     )

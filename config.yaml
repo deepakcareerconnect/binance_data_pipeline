@@ -1,0 +1,20 @@
+historical:
+  source: binance_vision
+  base_url: https://data.binance.vision
+
+  market: spot
+  data_type: klines
+
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+
+  interval: 1m
+
+  backfill:
+    frequency: monthly
+    start_date: "2025-01-01"
+
+  incremental:
+    frequency: daily
