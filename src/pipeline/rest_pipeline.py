@@ -3,36 +3,15 @@ import uuid
 
 from datetime import datetime, timezone
 
+from src.audit.audit_logger import create_audit_record
 from src.api.binance_rest import BinanceRESTClient
 from src.validation.validator import validate_kline_response
 from src.storage.s3_client import S3Client
-from src.audit.historical_audit_logger import create_audit_record
 from src.checkpoint.checkpoint_manager import CheckpointManager
 from src.storage.parquet_writer import convert_klines_to_parquet
 
+
 logger = logging.getLogger(__name__)
-
-
-def create_metadata(
-    symbol: str,
-    interval: str,
-    records: list,  
-    pipeline_run_id: str
-) -> dict:
-
-    return {
-        "source": "binance",
-        "source_type": "rest_api",
-        "dataset": "klines",
-        "symbol": symbol,
-        "interval": interval,
-        "ingested_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
-        "pipeline_run_id": pipeline_run_id,
-        "record_count": len(records),
-        "payload": records
-    }
 
 
 def run_pipeline():
@@ -46,7 +25,21 @@ def run_pipeline():
         )
     )
 
+    # ==================================================
+    # PIPELINE RUN ID
+    # ==================================================
+
+    # One unique ID for the complete pipeline execution
     pipeline_run_id = str(uuid.uuid4())
+
+    logger.info(
+        "Pipeline started | run_id=%s",
+        pipeline_run_id
+    )
+
+    # ==================================================
+    # BINANCE REST CLIENT
+    # ==================================================
 
     binance = BinanceRESTClient(
         base_url="https://api.binance.com",
@@ -54,14 +47,26 @@ def run_pipeline():
         backoff_factor=2
     )
 
+    # ==================================================
+    # S3 CLIENT
+    # ==================================================
+
     s3 = S3Client(
         bucket_name="binance-market-data-lake",
         region_name="ap-south-2"
     )
 
+    # ==================================================
+    # CHECKPOINT MANAGER
+    # ==================================================
+
     checkpoint_manager = CheckpointManager(
         s3_client=s3
     )
+
+    # ==================================================
+    # PIPELINE CONFIGURATION
+    # ==================================================
 
     symbols = [
         "BTCUSDT",
@@ -71,14 +76,21 @@ def run_pipeline():
 
     interval = "1m"
 
+    # ==================================================
+    # PROCESS EACH SYMBOL
+    # ==================================================
+
     for symbol in symbols:
 
         start_time = datetime.now(
             timezone.utc
-        ).isoformat()
+        )
 
         records_read = 0
         records_written = 0
+
+        # Reset data for every symbol
+        data = None
 
         try:
 
@@ -87,9 +99,9 @@ def run_pipeline():
                 symbol
             )
 
-            # ------------------------------------------
-            # 1. Extract
-            # ------------------------------------------
+            # ==================================================
+            # 1. EXTRACT
+            # ==================================================
 
             data = binance.get_klines(
                 symbol=symbol,
@@ -99,18 +111,25 @@ def run_pipeline():
 
             records_read = len(data)
 
-            # ------------------------------------------
-            # 2. Validate
-            # ------------------------------------------
+            logger.info(
+                "Extraction completed | "
+                "symbol=%s | records=%s",
+                symbol,
+                records_read
+            )
+
+            # ==================================================
+            # 2. VALIDATE
+            # ==================================================
 
             validate_kline_response(
                 data=data,
                 symbol=symbol
             )
 
-            # ------------------------------------------
-            # 3. Add metadata
-            # ------------------------------------------
+            # ==================================================
+            # 3. TRANSFORM
+            # ==================================================
 
             parquet_data = convert_klines_to_parquet(
                 records=data,
@@ -118,10 +137,27 @@ def run_pipeline():
                 interval=interval
             )
 
-            timestamp = datetime.now(timezone.utc)
+            logger.info(
+                "Transformation completed | "
+                "symbol=%s",
+                symbol
+            )
 
-            date = timestamp.strftime("%Y-%m-%d")
-            time_value = timestamp.strftime("%H%M%S")
+            # ==================================================
+            # 4. BUILD S3 KEY
+            # ==================================================
+
+            timestamp = datetime.now(
+                timezone.utc
+            )
+
+            date = timestamp.strftime(
+                "%Y-%m-%d"
+            )
+
+            time_value = timestamp.strftime(
+                "%H%M%S"
+            )
 
             s3_key = (
                 f"landing/rest/klines/"
@@ -132,6 +168,10 @@ def run_pipeline():
                 f"{pipeline_run_id}.parquet"
             )
 
+            # ==================================================
+            # 5. LOAD PARQUET TO S3
+            # ==================================================
+
             s3.upload_parquet(
                 parquet_data=parquet_data,
                 key=s3_key
@@ -139,9 +179,16 @@ def run_pipeline():
 
             records_written = len(data)
 
-            # ------------------------------------------
-            # 6. Save checkpoint
-            # ------------------------------------------
+            logger.info(
+                "Data loaded successfully | "
+                "symbol=%s | records=%s",
+                symbol,
+                records_written
+            )
+
+            # ==================================================
+            # 6. SAVE CHECKPOINT
+            # ==================================================
 
             last_timestamp = data[-1][6]
 
@@ -151,18 +198,38 @@ def run_pipeline():
                 last_processed_timestamp=last_timestamp
             )
 
-            # ------------------------------------------
-            # 7. Audit SUCCESS
-            # ------------------------------------------
+            logger.info(
+                "Checkpoint saved | "
+                "symbol=%s | timestamp=%s",
+                symbol,
+                last_timestamp
+            )
+
+            # ==================================================
+            # 7. CREATE SUCCESS AUDIT
+            # ==================================================
 
             audit_record = create_audit_record(
                 pipeline_name="binance_rest_ingestion",
+                run_id=pipeline_run_id,
                 symbol=symbol,
+                interval=interval,
                 records_read=records_read,
                 records_written=records_written,
                 status="SUCCESS",
-                start_time=start_time
+                start_time=start_time,
+                end_time=datetime.now(timezone.utc),
+                s3_key=s3_key,
+                source="binance_rest_api",
+                metadata={
+                    "dataset": "klines",
+                    "limit": 100
+                }
             )
+
+            # ==================================================
+            # 8. WRITE SUCCESS AUDIT TO S3
+            # ==================================================
 
             audit_key = (
                 f"metadata/ingestion_audit/"
@@ -177,31 +244,50 @@ def run_pipeline():
             )
 
             logger.info(
-                "Pipeline successful | symbol=%s",
+                "Audit record written | "
+                "symbol=%s | status=SUCCESS",
                 symbol
+            )
+
+            logger.info(
+                "Pipeline successful | "
+                "symbol=%s | run_id=%s",
+                symbol,
+                pipeline_run_id
             )
 
         except Exception as error:
 
+            # ==================================================
+            # PIPELINE FAILURE
+            # ==================================================
+
             logger.exception(
-                "Pipeline failed | symbol=%s",
-                symbol
+                "Pipeline failed | "
+                "symbol=%s | run_id=%s",
+                symbol,
+                pipeline_run_id
             )
 
-            # ------------------------------------------
-            # Quarantine
-            # ------------------------------------------
+            # ==================================================
+            # 9. QUARANTINE FAILED DATA
+            # ==================================================
 
             try:
 
-                s3.upload_quarantine(
-                    data=locals().get(
-                        "data",
-                        None
-                    ),
-                    symbol=symbol,
-                    error_message=str(error)
-                )
+                if data is not None:
+
+                    s3.upload_quarantine(
+                        data=data,
+                        symbol=symbol,
+                        error_message=str(error)
+                    )
+
+                    logger.warning(
+                        "Data moved to quarantine | "
+                        "symbol=%s",
+                        symbol
+                    )
 
             except Exception:
 
@@ -211,9 +297,9 @@ def run_pipeline():
                     symbol
                 )
 
-            # ------------------------------------------
-            # Audit FAILURE
-            # ------------------------------------------
+            # ==================================================
+            # 10. CREATE FAILURE AUDIT
+            # ==================================================
 
             try:
 
@@ -231,13 +317,25 @@ def run_pipeline():
 
                 audit_record = create_audit_record(
                     pipeline_name="binance_rest_ingestion",
+                    run_id=pipeline_run_id,
                     symbol=symbol,
+                    interval=interval,
                     records_read=records_read,
                     records_written=records_written,
                     status="FAILED",
                     start_time=start_time,
-                    error_message=str(error)
+                    end_time=datetime.now(timezone.utc),
+                    error_message=str(error),
+                    source="binance_rest_api",
+                    metadata={
+                        "dataset": "klines",
+                        "limit": 100
+                    }
                 )
+
+                # ==================================================
+                # 11. WRITE FAILURE AUDIT TO S3
+                # ==================================================
 
                 audit_key = (
                     f"metadata/ingestion_audit/"
@@ -251,11 +349,28 @@ def run_pipeline():
                     key=audit_key
                 )
 
+                logger.info(
+                    "Failure audit written | "
+                    "symbol=%s",
+                    symbol
+                )
+
             except Exception:
 
                 logger.exception(
-                    "Failed to write audit log"
+                    "Failed to write audit log | "
+                    "symbol=%s",
+                    symbol
                 )
+
+    # ==================================================
+    # PIPELINE COMPLETE
+    # ==================================================
+
+    logger.info(
+        "Pipeline completed | run_id=%s",
+        pipeline_run_id
+    )
 
 
 if __name__ == "__main__":
