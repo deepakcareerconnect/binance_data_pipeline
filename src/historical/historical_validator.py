@@ -8,6 +8,41 @@ logger = logging.getLogger(__name__)
 EXPECTED_FIELDS = 12
 
 
+def _normalize_timestamp_to_ms(timestamp: int) -> int:
+    """
+    Normalize timestamp to milliseconds.
+
+    Supported timestamp magnitudes:
+
+    milliseconds:
+        ~1.7e12
+
+    microseconds:
+        ~1.7e15
+
+    nanoseconds:
+        ~1.7e18
+    """
+
+    timestamp = int(timestamp)
+
+    # Milliseconds
+    if timestamp < 10**14:
+        return timestamp
+
+    # Microseconds
+    if timestamp < 10**17:
+        return timestamp // 1_000
+
+    # Nanoseconds
+    if timestamp < 10**20:
+        return timestamp // 1_000_000
+
+    raise ValueError(
+        f"Unsupported timestamp magnitude: {timestamp}"
+    )
+
+
 def validate_historical_records(
     records: list,
     symbol: str,
@@ -38,33 +73,47 @@ def validate_historical_records(
             f"symbol={symbol}"
         )
 
-    previous_open_time = None
+    previous_open_time_ms = None
 
     expected_interval_ms = None
 
+    # =========================================================
+    # Calculate expected interval
+    # =========================================================
+
     if interval.endswith("m"):
+
         minutes = int(
             interval[:-1]
         )
+
         expected_interval_ms = (
             minutes * 60 * 1000
         )
 
     elif interval.endswith("h"):
+
         hours = int(
             interval[:-1]
         )
+
         expected_interval_ms = (
             hours * 60 * 60 * 1000
         )
 
     elif interval.endswith("d"):
+
         days = int(
             interval[:-1]
         )
+
         expected_interval_ms = (
             days * 24 * 60 * 60 * 1000
         )
+
+    # =========================================================
+    # Validate records
+    # =========================================================
 
     for index, record in enumerate(records):
 
@@ -73,6 +122,7 @@ def validate_historical_records(
         # -----------------------------------------------------
 
         if len(record) != EXPECTED_FIELDS:
+
             raise ValueError(
                 f"Invalid record at row {index} | "
                 f"expected {EXPECTED_FIELDS} fields | "
@@ -81,7 +131,7 @@ def validate_historical_records(
 
         try:
 
-            open_time = int(
+            raw_open_time = int(
                 record[0]
             )
 
@@ -105,7 +155,7 @@ def validate_historical_records(
                 record[5]
             )
 
-            close_time = int(
+            raw_close_time = int(
                 record[6]
             )
 
@@ -136,6 +186,18 @@ def validate_historical_records(
             ) from error
 
         # -----------------------------------------------------
+        # Normalize timestamps for validation
+        # -----------------------------------------------------
+
+        open_time_ms = _normalize_timestamp_to_ms(
+            raw_open_time
+        )
+
+        close_time_ms = _normalize_timestamp_to_ms(
+            raw_close_time
+        )
+
+        # -----------------------------------------------------
         # Numeric validity
         # -----------------------------------------------------
 
@@ -154,6 +216,7 @@ def validate_historical_records(
             math.isfinite(value)
             for value in numeric_values
         ):
+
             raise ValueError(
                 f"Non-finite numeric value at row {index}"
             )
@@ -162,12 +225,14 @@ def validate_historical_records(
         # Timestamp validation
         # -----------------------------------------------------
 
-        if open_time <= 0:
+        if open_time_ms <= 0:
+
             raise ValueError(
                 f"Invalid open_time at row {index}"
             )
 
-        if close_time <= open_time:
+        if close_time_ms <= open_time_ms:
+
             raise ValueError(
                 f"Invalid timestamp range at row {index}"
             )
@@ -192,6 +257,7 @@ def validate_historical_records(
             close_price,
             low_price
         ):
+
             raise ValueError(
                 f"Invalid high price at row {index}"
             )
@@ -201,6 +267,7 @@ def validate_historical_records(
             close_price,
             high_price
         ):
+
             raise ValueError(
                 f"Invalid low price at row {index}"
             )
@@ -210,22 +277,26 @@ def validate_historical_records(
         # -----------------------------------------------------
 
         if volume < 0:
+
             raise ValueError(
                 f"Negative volume at row {index}"
             )
 
         if quote_asset_volume < 0:
+
             raise ValueError(
                 f"Negative quote volume at row {index}"
             )
 
         if taker_buy_base_volume < 0:
+
             raise ValueError(
                 f"Negative taker-buy base volume "
                 f"at row {index}"
             )
 
         if taker_buy_quote_volume < 0:
+
             raise ValueError(
                 f"Negative taker-buy quote volume "
                 f"at row {index}"
@@ -236,6 +307,7 @@ def validate_historical_records(
         # -----------------------------------------------------
 
         if number_of_trades < 0:
+
             raise ValueError(
                 f"Negative number_of_trades "
                 f"at row {index}"
@@ -245,9 +317,10 @@ def validate_historical_records(
         # Duplicate / ordering validation
         # -----------------------------------------------------
 
-        if previous_open_time is not None:
+        if previous_open_time_ms is not None:
 
-            if open_time <= previous_open_time:
+            if open_time_ms <= previous_open_time_ms:
+
                 raise ValueError(
                     f"Duplicate or out-of-order "
                     f"open_time at row {index}"
@@ -256,11 +329,12 @@ def validate_historical_records(
             if expected_interval_ms is not None:
 
                 actual_difference = (
-                    open_time
-                    - previous_open_time
+                    open_time_ms
+                    - previous_open_time_ms
                 )
 
                 if actual_difference != expected_interval_ms:
+
                     raise ValueError(
                         f"Unexpected timestamp gap at "
                         f"row {index} | "
@@ -268,7 +342,11 @@ def validate_historical_records(
                         f"actual={actual_difference} ms"
                     )
 
-        previous_open_time = open_time
+        previous_open_time_ms = open_time_ms
+
+    # =========================================================
+    # Validation successful
+    # =========================================================
 
     logger.info(
         "Historical validation successful | "
