@@ -137,14 +137,36 @@ class HistoricalPipeline:
                 f"{archive_path.name}"
             )
 
+
         try:
-            year = int(parts[-2])
-            month = int(parts[-1])
+            # Monthly archive: BTCUSDT-1m-2026-10
+            if len(parts) == 4:
+                year = int(parts[-2])
+                month = int(parts[-1])
+
+            # Daily archive: BTCUSDT-1m-2026-10-01
+            elif len(parts) == 5:
+                year = int(parts[-3])
+                month = int(parts[-2])
+
+            else:
+                raise ValueError(
+                    f"Unexpected archive filename format: "
+                    f"{archive_path.name}"
+                )
+
+            if not 2000 <= year <= 2100:
+                raise ValueError(f"Invalid year: {year}")
+
+            if not 1 <= month <= 12:
+                raise ValueError(f"Invalid month: {month}")
+
         except ValueError as error:
             raise ValueError(
-                f"Unable to determine year/month from archive: "
+                f"Unable to determine valid year/month from archive: "
                 f"{archive_path.name}"
             ) from error
+
 
         parquet_filename = f"{archive_stem}.parquet"
 
