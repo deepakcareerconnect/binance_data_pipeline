@@ -76,7 +76,10 @@ def main():
         "fs.s3a.aws.credentials.provider",
         "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
     )
-    hadoop_conf.set("fs.s3a.endpoint.region", AWS_REGION)
+    hadoop_conf.set(
+        "fs.s3a.endpoint",
+        f"s3.{AWS_REGION}.amazonaws.com",
+    )
 
     kafka_df = (
         spark.readStream

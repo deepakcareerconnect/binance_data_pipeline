@@ -228,22 +228,23 @@ def run_historical_batch():
                 # Result classification
                 # -----------------------------------------
 
+                
                 if status == "SKIPPED_ALREADY_EXISTS":
-
                     skipped += 1
 
-                elif status in (
-                    "SUCCESS",
-                    "COMPLETED"
-                ):
-
+                elif status in ("SUCCESS", "COMPLETED"):
                     successful += 1
 
                 else:
+                    failed += 1
 
-                    # Treat unknown statuses as successful
-                    # only if process_archive completed
-                    successful += 1
+                    logger.error(
+                        "Unexpected archive status | symbol=%s | archive=%s | status=%s",
+                        symbol,
+                        archive_path.name,
+                        status,
+                    )
+
 
                 logger.info(
                     "Archive completed | "
