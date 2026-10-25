@@ -62,7 +62,11 @@ TRADE_SCHEMA = StructType([
 def main():
     spark = (
         SparkSession.builder
-        .appName("BinanceWebSocketKafkaToS3")
+        .appName("BinanceTradesToS3")
+        .config(
+            "spark.jars.packages",
+            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6"
+        )
         .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
