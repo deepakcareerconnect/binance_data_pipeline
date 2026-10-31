@@ -11,3 +11,13 @@ __pycache__/
 .idea/
 
 *.log
+
+.env.*
+!.env.example
+
+airflow/.env
+ai_serving/.env
+
+airflow/logs/
+
+credentials.txt

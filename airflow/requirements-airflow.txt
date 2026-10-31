@@ -1,6 +1,6 @@
 apache-airflow-providers-amazon
 apache-airflow-providers-databricks
-apache-airflow-providers-fab
+apache-airflow-providers-standard
 requests
 boto3
 pyarrow

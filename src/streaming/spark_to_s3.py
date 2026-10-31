@@ -32,18 +32,23 @@ KAFKA_TOPIC = os.getenv(
     "KAFKA_TOPIC", "binance.trades.raw"
 )
 S3_BUCKET = os.getenv("S3_BUCKET")
-AWS_REGION = os.getenv("AWS_REGION", "ap-south-2")
+AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 
 if not S3_BUCKET:
     raise RuntimeError("Set the S3_BUCKET environment variable first.")
 
-S3_OUTPUT_PATH = (
-    f"s3a://{S3_BUCKET}/landing/streaming/trades/"
+S3_OUTPUT_PATH = os.getenv(
+    "S3_OUTPUT_PATH",
+    f"s3a://{S3_BUCKET}/landing/streaming/trades_recovery/",
 )
-S3_CHECKPOINT_PATH = (
-    f"s3a://{S3_BUCKET}/metadata/checkpoints/"
-    "binance_trades_streaming/"
+
+S3_CHECKPOINT_PATH = os.getenv(
+    "S3_CHECKPOINT_PATH",
+    f"s3a://{S3_BUCKET}/metadata/checkpoints/binance_trades_streaming_v2/",
 )
+
+STARTING_OFFSETS = os.getenv("KAFKA_STARTING_OFFSETS", "earliest")
+
 
 TRADE_SCHEMA = StructType([
     StructField("source", StringType(), True),
@@ -62,12 +67,37 @@ TRADE_SCHEMA = StructType([
 def main():
     spark = (
         SparkSession.builder
-        .appName("BinanceTradesToS3")
+        .appName("BinanceTradesToS3Recovery")
         .config(
             "spark.jars.packages",
-            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6"
+            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6,"
+            "org.apache.hadoop:hadoop-aws:3.3.4,"
+            "com.amazonaws:aws-java-sdk-bundle:1.12.262"
         )
-        .config("spark.sql.session.timeZone", "UTC")
+        .config(
+            "spark.hadoop.fs.s3a.endpoint",
+            "s3.ap-south-1.amazonaws.com"
+        )
+        .config(
+            "spark.hadoop.fs.s3a.endpoint.region",
+            "ap-south-1"
+        )
+        .config(
+            "spark.hadoop.fs.s3a.path.style.access",
+            "false"
+        )
+        .config(
+            "spark.hadoop.fs.s3a.fast.upload",
+            "true"
+        )
+        .config(
+            "spark.hadoop.fs.s3a.fast.upload.buffer",
+            "array"
+        )
+        .config(
+            "spark.hadoop.fs.s3a.multipart.size",
+            str(10 * 1024 * 1024)
+        )
         .getOrCreate()
     )
 
@@ -90,7 +120,7 @@ def main():
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
         .option("subscribe", KAFKA_TOPIC)
-        .option("startingOffsets", "earliest")
+        .option("startingOffsets", STARTING_OFFSETS)
         .option("failOnDataLoss", "true")
         .load()
     )
@@ -165,7 +195,9 @@ def main():
 
     logger.info("Spark streaming query started")
     logger.info("Kafka topic: %s", KAFKA_TOPIC)
+    logger.info("Kafka starting offsets: %s", STARTING_OFFSETS)
     logger.info("S3 destination: %s", S3_OUTPUT_PATH)
+    logger.info("Checkpoint location: %s", S3_CHECKPOINT_PATH)
 
     try:
         query.awaitTermination()

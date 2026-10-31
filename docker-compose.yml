@@ -1,5 +1,8 @@
 
 services:
+  # ==========================================================
+  # KAFKA
+  # ==========================================================
   kafka:
     image: apache/kafka:4.1.0
     container_name: binance-kafka
@@ -21,7 +24,11 @@ services:
       KAFKA_NUM_PARTITIONS: 3
     volumes:
       - kafka_data:/var/lib/kafka/data
+    restart: unless-stopped
 
+  # ==========================================================
+  # SPARK
+  # ==========================================================
   spark:
     image: apache/spark:3.5.6
     container_name: binance-spark
@@ -29,13 +36,178 @@ services:
       - kafka
     working_dir: /opt/project
     environment:
-      AWS_PROFILE: default
-      AWS_REGION: ap-south-1
-      AWS_DEFAULT_REGION: ap-south-1
+      AWS_REGION: ${AWS_DEFAULT_REGION:-ap-south-2}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-south-2}
     volumes:
       - .:/opt/project
       - ${USERPROFILE}/.aws:/home/spark/.aws:ro
     command: ["/bin/bash", "-lc", "sleep infinity"]
+    restart: unless-stopped
+  
+  # ==========================================================
+  # AI SERVING - FASTAPI
+  # ==========================================================
+  ai-serving:
+    build:
+      context: .
+      dockerfile: ai_serving/Dockerfile
+    image: binance-ai-serving:latest
+    container_name: binance-ai-serving
+    working_dir: /app
+    command:
+      - uvicorn
+      - ai_serving.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./ai_serving/.env
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ==========================================================
+  # AIRFLOW METADATA DATABASE
+  # ==========================================================
+  airflow-postgres:
+    image: postgres:16
+    container_name: binance-airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ==========================================================
+  # COMMON AIRFLOW CONFIGURATION
+  # ==========================================================
+  airflow-common: &airflow-common
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    image: binance-airflow:3.3.2
+    environment: &airflow-environment
+      AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET}
+
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/airflow
+
+      # Airflow 3 authentication
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
+
+      # Core settings
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+
+      # Security
+      AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:?Set AIRFLOW_API_SECRET_KEY in root .env}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?Set AIRFLOW_FERNET_KEY in root .env}
+
+      # Scheduler and DAG processor
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+      AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+
+      # Binance project settings
+      PYTHONPATH: /opt/airflow/project
+      S3_BUCKET: ${S3_BUCKET:-binance-market-data-lake}
+      S3_STREAMING_PREFIX: landing/streaming/trades_recovery/
+      AWS_SHARED_CREDENTIALS_FILE: /home/airflow/.aws/credentials
+      AWS_CONFIG_FILE: /home/airflow/.aws/config
+      AWS_DEFAULT_REGION: ap-south-1
+      STREAMING_FRESHNESS_MINUTES: "10"
+      AI_API_BASE_URL: ${AI_API_BASE_URL:-http://host.docker.internal:8000}
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - .:/opt/airflow/project
+      - ${USERPROFILE}/.aws:/home/airflow/.aws:ro
+
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ==========================================================
+  # AIRFLOW INITIALIZATION
+  # ==========================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: binance-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - airflow db migrate
+    environment:
+      <<: *airflow-environment
+    restart: "no"
+
+  # ==========================================================
+  # AIRFLOW API SERVER
+  # ==========================================================
+  airflow-api-server:
+    <<: *airflow-common
+    container_name: binance-airflow-api-server
+    command: api-server
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ==========================================================
+  # AIRFLOW SCHEDULER
+  # ==========================================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: binance-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ==========================================================
+  # AIRFLOW DAG PROCESSOR
+  # ==========================================================
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: binance-airflow-dag-processor
+    command: dag-processor
+
+  # ==========================================================
+  # AIRFLOW TRIGGERER
+  # ==========================================================
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: binance-airflow-triggerer
+    command: triggerer
 
 volumes:
   kafka_data:
+  airflow_postgres_data:
