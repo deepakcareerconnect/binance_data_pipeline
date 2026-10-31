@@ -17,6 +17,7 @@ __pycache__/
 
 airflow/.env
 ai_serving/.env
+ai_serving/.env.example
 
 airflow/logs/
 
