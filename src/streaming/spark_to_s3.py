@@ -1,210 +1,303 @@
 
-import logging
 import os
+import logging
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col,
-    current_timestamp,
-    from_json,
-    to_timestamp,
-    to_date,
-    expr,
-)
+from pyspark.sql import functions as F
 from pyspark.sql.types import (
     StructType,
     StructField,
     StringType,
-    LongType,
     BooleanType,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-logger = logging.getLogger(__name__)
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+APP_NAME = "binance-kafka-to-s3-streaming"
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv(
     "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"
 )
+
 KAFKA_TOPIC = os.getenv(
     "KAFKA_TOPIC", "binance.trades.raw"
 )
-S3_BUCKET = os.getenv("S3_BUCKET")
-AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
-
-if not S3_BUCKET:
-    raise RuntimeError("Set the S3_BUCKET environment variable first.")
 
 S3_OUTPUT_PATH = os.getenv(
     "S3_OUTPUT_PATH",
-    f"s3a://{S3_BUCKET}/landing/streaming/trades_recovery/",
+    "s3a://binance-market-data-lake/landing/streaming/trades_recovery_v2/"
 )
 
-S3_CHECKPOINT_PATH = os.getenv(
+CHECKPOINT_PATH = os.getenv(
     "S3_CHECKPOINT_PATH",
-    f"s3a://{S3_BUCKET}/metadata/checkpoints/binance_trades_streaming_v2/",
+    "s3a://binance-market-data-lake/metadata/checkpoints/binance_trades_streaming_v3/"
 )
 
-STARTING_OFFSETS = os.getenv("KAFKA_STARTING_OFFSETS", "earliest")
+KAFKA_STARTING_OFFSETS = os.getenv(
+    "KAFKA_STARTING_OFFSETS", "earliest"
+)
 
+MAX_OFFSETS_PER_TRIGGER = os.getenv(
+    "MAX_OFFSETS_PER_TRIGGER", "10000"
+)
 
-TRADE_SCHEMA = StructType([
-    StructField("source", StringType(), True),
+TRIGGER_INTERVAL = os.getenv(
+    "TRIGGER_INTERVAL", "30 seconds"
+)
+
+# ============================================================
+# 2. LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+logger = logging.getLogger(APP_NAME)
+
+# ============================================================
+# 3. SPARK SESSION
+# ============================================================
+
+spark = (
+    SparkSession.builder
+    .appName(APP_NAME)
+
+    .config(
+        "spark.jars.packages",
+        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6,"
+        "org.apache.hadoop:hadoop-aws:3.3.4,"
+        "com.amazonaws:aws-java-sdk-bundle:1.12.262"
+    )
+
+    .config("spark.sql.session.timeZone", "UTC")
+    .config("spark.sql.shuffle.partitions", "3")
+    .config(
+        "spark.streaming.stopGracefullyOnShutdown",
+        "true"
+    )
+
+    .getOrCreate()
+)
+
+spark.sparkContext.setLogLevel("WARN")
+
+logger.info("Starting Binance streaming ingestion")
+logger.info("Kafka topic: %s", KAFKA_TOPIC)
+logger.info("Kafka brokers: %s", KAFKA_BOOTSTRAP_SERVERS)
+logger.info("S3 output: %s", S3_OUTPUT_PATH)
+logger.info("Checkpoint: %s", CHECKPOINT_PATH)
+logger.info("Starting offsets: %s", KAFKA_STARTING_OFFSETS)
+
+# ============================================================
+# 4. EXPECTED KAFKA JSON SCHEMA
+# ============================================================
+
+trade_schema = StructType([
+    # Standard Binance fields
+    StructField("e", StringType(), True),
+    StructField("s", StringType(), True),
+    StructField("t", StringType(), True),
+    StructField("p", StringType(), True),
+    StructField("q", StringType(), True),
+    StructField("T", StringType(), True),
+    StructField("m", BooleanType(), True),
+
+    # Descriptive project fields
     StructField("event_type", StringType(), True),
     StructField("symbol", StringType(), True),
-    StructField("trade_id", LongType(), True),
+    StructField("trade_id", StringType(), True),
     StructField("price", StringType(), True),
     StructField("quantity", StringType(), True),
-    StructField("trade_time_ms", LongType(), True),
-    StructField("event_time_ms", LongType(), True),
-    StructField("is_buyer_market_maker", BooleanType(), True),
-    StructField("ingested_at", StringType(), True),
+    StructField("trade_timestamp", StringType(), True),
+    StructField(
+        "is_buyer_market_maker",
+        BooleanType(),
+        True
+    ),
 ])
 
+# ============================================================
+# 5. READ FROM KAFKA
+# ============================================================
 
-def main():
-    spark = (
-        SparkSession.builder
-        .appName("BinanceTradesToS3Recovery")
-        .config(
-            "spark.jars.packages",
-            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6,"
-            "org.apache.hadoop:hadoop-aws:3.3.4,"
-            "com.amazonaws:aws-java-sdk-bundle:1.12.262"
-        )
-        .config(
-            "spark.hadoop.fs.s3a.endpoint",
-            "s3.ap-south-1.amazonaws.com"
-        )
-        .config(
-            "spark.hadoop.fs.s3a.endpoint.region",
-            "ap-south-1"
-        )
-        .config(
-            "spark.hadoop.fs.s3a.path.style.access",
-            "false"
-        )
-        .config(
-            "spark.hadoop.fs.s3a.fast.upload",
-            "true"
-        )
-        .config(
-            "spark.hadoop.fs.s3a.fast.upload.buffer",
-            "array"
-        )
-        .config(
-            "spark.hadoop.fs.s3a.multipart.size",
-            str(10 * 1024 * 1024)
-        )
-        .getOrCreate()
+kafka_stream = (
+    spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
+    .option("subscribe", KAFKA_TOPIC)
+    .option("startingOffsets", KAFKA_STARTING_OFFSETS)
+    .option("failOnDataLoss", "true")
+    .option("maxOffsetsPerTrigger", MAX_OFFSETS_PER_TRIGGER)
+    .load()
+)
+
+# ============================================================
+# 6. PARSE JSON
+# ============================================================
+
+parsed_stream = (
+    kafka_stream
+    .select(
+        F.col("key").cast("string").alias("kafka_key"),
+        F.col("value").cast("string").alias("raw_json"),
+        F.col("topic").alias("kafka_topic"),
+        F.col("partition").alias("kafka_partition"),
+        F.col("offset").alias("kafka_offset"),
+        F.col("timestamp").alias("kafka_timestamp"),
     )
-
-    spark.sparkContext.setLogLevel("WARN")
-
-    # S3A uses the AWS credential provider chain by default.
-    # This allows standard environment or AWS profile credentials.
-    hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
-    hadoop_conf.set(
-        "fs.s3a.aws.credentials.provider",
-        "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
+    .withColumn(
+        "payload",
+        F.from_json(F.col("raw_json"), trade_schema)
     )
-    hadoop_conf.set(
-        "fs.s3a.endpoint",
-        f"s3.{AWS_REGION}.amazonaws.com",
-    )
+)
 
-    kafka_df = (
-        spark.readStream
-        .format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
-        .option("subscribe", KAFKA_TOPIC)
-        .option("startingOffsets", STARTING_OFFSETS)
-        .option("failOnDataLoss", "true")
-        .load()
-    )
+# ============================================================
+# 7. NORMALIZE TRADE FIELDS
+# ============================================================
 
-    raw_df = kafka_df.select(
-        col("key").cast("string").alias("kafka_key"),
-        col("value").cast("string").alias("raw_json"),
-        col("topic").alias("kafka_topic"),
-        col("partition").alias("kafka_partition"),
-        col("offset").alias("kafka_offset"),
-        col("timestamp").alias("kafka_timestamp"),
-    )
-
-    parsed_df = raw_df.withColumn(
-        "trade",
-        from_json(col("raw_json"), TRADE_SCHEMA),
-    )
-
-    valid_df = (
-        parsed_df
-        .filter(col("trade").isNotNull())
-        .select(
-            "kafka_key",
-            "kafka_topic",
-            "kafka_partition",
-            "kafka_offset",
-            "kafka_timestamp",
-            "raw_json",
-            col("trade.source").alias("source"),
-            col("trade.event_type").alias("event_type"),
-            col("trade.symbol").alias("symbol"),
-            col("trade.trade_id").alias("trade_id"),
-            col("trade.price").cast("decimal(30, 12)").alias("price"),
-            col("trade.quantity").cast("decimal(30, 12)").alias("quantity"),
-            (
-                expr("timestamp_millis(trade.trade_time_ms)")
-            ).alias("trade_timestamp"),
-            (
-                expr("timestamp_millis(trade.event_time_ms)")
-            ).alias("event_timestamp"),
-            col("trade.is_buyer_market_maker").alias(
-                "is_buyer_market_maker"
-            ),
-            to_timestamp(
-                col("trade.ingested_at")
-            ).alias("producer_ingested_at"),
-            current_timestamp().alias("spark_processed_at"),
-        )
-        .filter(
-            col("symbol").isNotNull()
-            & col("trade_id").isNotNull()
-            & col("price").isNotNull()
-            & col("quantity").isNotNull()
-            & col("trade_timestamp").isNotNull()
-        )
-        .withColumn(
-            "event_date",
-            to_date(col("trade_timestamp")),
+normalized = (
+    parsed_stream
+    .withColumn(
+        "symbol",
+        F.upper(
+            F.coalesce(
+                F.col("payload.s"),
+                F.col("payload.symbol")
+            )
         )
     )
-
-    query = (
-        valid_df.writeStream
-        .format("parquet")
-        .outputMode("append")
-        .option("path", S3_OUTPUT_PATH)
-        .option("checkpointLocation", S3_CHECKPOINT_PATH)
-        .partitionBy("symbol", "event_date")
-        .trigger(processingTime="30 seconds")
-        .start()
+    .withColumn(
+        "trade_id",
+        F.coalesce(
+            F.col("payload.t"),
+            F.col("payload.trade_id")
+        )
     )
+    .withColumn(
+        "price",
+        F.coalesce(
+            F.col("payload.p"),
+            F.col("payload.price")
+        ).cast("double")
+    )
+    .withColumn(
+        "quantity",
+        F.coalesce(
+            F.col("payload.q"),
+            F.col("payload.quantity")
+        ).cast("double")
+    )
+    .withColumn(
+        "timestamp_text",
+        F.coalesce(
+            F.col("payload.T"),
+            F.col("payload.trade_timestamp")
+        )
+    )
+    .withColumn(
+        "is_buyer_market_maker",
+        F.coalesce(
+            F.col("payload.m"),
+            F.col("payload.is_buyer_market_maker")
+        )
+    )
+    .withColumn(
+        "event_type",
+        F.coalesce(
+            F.col("payload.e"),
+            F.col("payload.event_type")
+        )
+    )
+)
 
-    logger.info("Spark streaming query started")
-    logger.info("Kafka topic: %s", KAFKA_TOPIC)
-    logger.info("Kafka starting offsets: %s", STARTING_OFFSETS)
-    logger.info("S3 destination: %s", S3_OUTPUT_PATH)
-    logger.info("Checkpoint location: %s", S3_CHECKPOINT_PATH)
+# Accept either epoch milliseconds or an ISO timestamp.
+normalized = normalized.withColumn(
+    "trade_timestamp",
+    F.coalesce(
+        F.expr(
+            "timestamp_millis(try_cast(timestamp_text AS BIGINT))"
+        ),
+        F.to_timestamp("timestamp_text"),
+        F.col("kafka_timestamp")
+    )
+)
 
-    try:
-        query.awaitTermination()
-    finally:
-        query.stop()
-        spark.stop()
+# ============================================================
+# 8. VALIDATE RECORDS
+# ============================================================
 
+valid_stream = normalized.filter(
+    F.col("payload").isNotNull()
+    & F.col("symbol").isNotNull()
+    & F.col("trade_id").isNotNull()
+    & F.col("price").isNotNull()
+    & F.col("quantity").isNotNull()
+    & F.col("trade_timestamp").isNotNull()
+)
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# 9. FINAL S3 DATASET
+# ============================================================
+
+final_stream = (
+    valid_stream
+    .withColumn(
+        "quote_value",
+        F.col("price") * F.col("quantity")
+    )
+    .withColumn(
+        "event_date",
+        F.to_date("trade_timestamp")
+    )
+    .withColumn(
+        "ingested_at",
+        F.current_timestamp()
+    )
+    .select(
+        "symbol",
+        "trade_id",
+        "trade_timestamp",
+        "price",
+        "quantity",
+        "quote_value",
+        "is_buyer_market_maker",
+        "event_type",
+        "event_date",
+        "ingested_at",
+        "kafka_topic",
+        "kafka_partition",
+        "kafka_offset",
+        "raw_json"
+    )
+)
+
+# ============================================================
+# 10. WRITE CONTINUOUSLY TO S3
+# ============================================================
+
+query = (
+    final_stream.writeStream
+    .format("parquet")
+    .outputMode("append")
+    .option("path", S3_OUTPUT_PATH)
+    .option("checkpointLocation", CHECKPOINT_PATH)
+    .partitionBy("symbol", "event_date")
+    .trigger(processingTime=TRIGGER_INTERVAL)
+    .start()
+)
+
+logger.info("Streaming query started")
+logger.info("Query ID: %s", query.id)
+logger.info("Run ID: %s", query.runId)
+
+try:
+    query.awaitTermination()
+except KeyboardInterrupt:
+    logger.info("Shutdown requested. Stopping streaming query.")
+    query.stop()
+finally:
+    spark.stop()

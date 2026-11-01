@@ -22,3 +22,6 @@ ai_serving/.env.example
 airflow/logs/
 
 credentials.txt
+
+.spark-ivy/
+.run/

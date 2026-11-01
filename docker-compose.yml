@@ -22,8 +22,42 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     volumes:
       - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # ==========================================================
+  # KAFKA OFFSET EXPORTER
+  # ==========================================================
+  kafka-offset-exporter:
+    image: apache/kafka:4.1.0
+    container_name: binance-kafka-offset-exporter
+    depends_on:
+      kafka:
+        condition: service_healthy
+    user: root
+    environment:
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-binance.trades.raw}
+    volumes:
+      - .:/opt/project
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - |
+        mkdir -p /opt/project/.run
+        while true; do
+          ts=$$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          offsets=$$(/opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:29092 --topic "$${KAFKA_TOPIC}" --time latest 2>/dev/null | tr '\n' ',' | sed 's/,$$//')
+          printf '{"timestamp":"%s","topic":"%s","offsets":"%s"}\n' "$$ts" "$${KAFKA_TOPIC}" "$$offsets" > /opt/project/.run/kafka_latest.json.tmp
+          mv /opt/project/.run/kafka_latest.json.tmp /opt/project/.run/kafka_latest.json
+          sleep 30
+        done
     restart: unless-stopped
 
   # ==========================================================
@@ -44,6 +78,50 @@ services:
     command: ["/bin/bash", "-lc", "sleep infinity"]
     restart: unless-stopped
   
+  # ==========================================================
+  # SPARK STREAMING - KAFKA TO S3
+  # ==========================================================
+  spark-streaming:
+    image: apache/spark:3.5.6
+    container_name: binance-spark-streaming
+    depends_on:
+      kafka:
+        condition: service_healthy
+    working_dir: /opt/project
+    environment:
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-south-1}
+      AWS_SHARED_CREDENTIALS_FILE: /home/spark/.aws/credentials
+      AWS_CONFIG_FILE: /home/spark/.aws/config
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      KAFKA_STARTING_OFFSETS: earliest
+      S3_BUCKET: ${S3_BUCKET}
+      S3_OUTPUT_PATH: s3a://${S3_BUCKET}/landing/streaming/trades_recovery/
+      S3_CHECKPOINT_PATH: s3a://${S3_BUCKET}/metadata/checkpoints/binance_trades_streaming_v2/
+    volumes:
+      - .:/opt/project
+      - ${USERPROFILE}/.aws:/home/spark/.aws:ro
+      - spark_ivy:/tmp/.ivy2
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - --driver-memory
+      - 2g
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --conf
+      - spark.executor.heartbeatInterval=60s
+      - --conf
+      - spark.network.timeout=300s
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
+      - --conf
+      - spark.sql.streaming.stopGracefullyOnShutdown=true
+      - src/streaming/spark_to_s3_recovery.py
+    restart: unless-stopped
+
   # ==========================================================
   # AI SERVING - FASTAPI
   # ==========================================================
@@ -136,6 +214,12 @@ services:
       AWS_CONFIG_FILE: /home/airflow/.aws/config
       AWS_DEFAULT_REGION: ap-south-1
       STREAMING_FRESHNESS_MINUTES: "10"
+      STREAMING_CHECKPOINT_FRESHNESS_MINUTES: "6"
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-binance.trades.raw}
+      KAFKA_MAX_LAG_MESSAGES: "5000"
+      KAFKA_HEALTH_FRESHNESS_MINUTES: "3"
+      S3_CHECKPOINT_PREFIX: metadata/checkpoints/binance_trades_streaming_v2/
+      MAX_ORPHAN_FILES: "12"
       AI_API_BASE_URL: ${AI_API_BASE_URL:-http://host.docker.internal:8000}
 
     volumes:
@@ -211,3 +295,5 @@ services:
 volumes:
   kafka_data:
   airflow_postgres_data:
+  spark_ivy:
+    name: binance_spark_ivy
