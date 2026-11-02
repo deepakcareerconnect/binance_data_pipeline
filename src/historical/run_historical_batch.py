@@ -228,7 +228,7 @@ def run_historical_batch():
                 # Result classification
                 # -----------------------------------------
 
-                
+
                 if status == "SKIPPED_ALREADY_EXISTS":
                     skipped += 1
 
