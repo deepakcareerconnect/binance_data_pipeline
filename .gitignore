@@ -4,6 +4,9 @@ __pycache__/
 
 .env
 
+# Local historical market data (downloaded datasets, not source)
+data/historical/
+
 .pytest_cache/
 .coverage
 
@@ -17,7 +20,7 @@ __pycache__/
 
 airflow/.env
 ai_serving/.env
-ai_serving/.env.example
+!ai_serving/.env.example
 
 airflow/logs/
 
