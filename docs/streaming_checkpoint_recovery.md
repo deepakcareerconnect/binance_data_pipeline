@@ -9,8 +9,12 @@ Scope: the Kafka to Spark to S3 recovery stream.
 - Source job: `src/streaming/spark_to_s3_recovery.py`
 - Airflow monitor: `binance_streaming_monitor`
 
-This runbook does not change the Databricks Bronze/Silver/Gold path. Bronze still reads
-`landing/streaming/trades/` until the explicit Phase 6 path switch.
+Phase 6 switched only the streaming Bronze source. Bronze now reads
+`landing/streaming/trades_recovery/` through the streaming-only run suffix
+`bronze_streaming_recovery_20261101_v1`. The historical/REST checkpoints remain on
+`bronze_rebuild_20261021_v3`, and the old `landing/streaming/trades/` data remains in
+the existing Bronze table. The Gold jobs are still explicit full-refresh writes; see
+section 7 before resuming `binance_end_to_end`.
 
 ## 1. Current verified backup
 
@@ -161,10 +165,74 @@ Consequences:
 - Silver reads the full Bronze table on each run. The dedupe is defensive across
   full-table reprocessing, not only across one batch.
 
-## 7. Known limitations
+## 7. Phase 6 validation snapshot
 
-- Bronze still reads `landing/streaming/trades/`, not `trades_recovery/`.
-- The new recovery data has therefore not reached Bronze/Silver/Gold yet.
+Streaming-only Databricks configuration:
+
+- Bronze source: `s3://binance-market-data-lake/landing/streaming/trades_recovery/`
+- Bronze checkpoint: `s3://binance-market-data-lake/metadata/databricks/checkpoints/streaming_trades/bronze_streaming_recovery_20261101_v1/`
+- Historical/REST suffix: `bronze_rebuild_20261021_v3` (unchanged)
+
+Validated results after the switch:
+
+- Bronze: 217,572 raw rows, 213,021 unique `(symbol, trade_id)` keys. Bronze is append-only.
+- Silver `market_trades`: 213,021 rows, 213,021 unique `(symbol, trade_id)` keys, written
+  with Delta `MERGE`; no quarantine rows were produced.
+- The 4,551 raw duplicate rows collapsed by Silver include the 12 retained orphan
+  Parquet files (4,505 rows). The orphans remain in place.
+- Gold `fact_market_trades`: 213,021 rows. The current production Gold tables were
+  full-refreshed by the existing pipeline at 13:59-14:00 UTC on 2026-11-01, before the
+  versioned recovery path was created.
+- `binance_streaming_monitor` is unpaused and its four checks pass.
+- `binance_end_to_end` is paused. A 16:00 UTC scheduled run on 2026-11-02 was stopped
+  before any Databricks task. The Databricks jobs have no native schedule; Airflow is
+  the only trigger.
+
+### Versioned Gold recovery path
+
+The non-destructive Gold path is built and validated:
+
+- `binance_data.gold_analytics_recovery_v1`
+  - `dim_date`: 670
+  - `dim_time`: 1,440
+  - `dim_symbol`: 3
+  - `dim_interval`: 1
+  - `fact_market_klines`: 2,784,024
+  - `fact_market_trades`: 213,021
+- `binance_data.gold_ai_recovery_v1`
+  - `market_1m`: 2,784,024
+  - `market_indicators`: 2,784,024
+  - `market_activity`: 527
+
+Recovery jobs, both without a native schedule:
+
+- `binance_gold_analytics_recovery_v1`: job ID `625607989294712`
+- `binance_gold_ai_recovery_v1`: job ID `115647081691022`
+
+Validated runs:
+
+- Gold analytics recovery: `run_id 897636312259944` (success)
+- Gold AI recovery: `run_id 778062515680054` (success)
+
+The recovery notebooks live under `/Workspace/consolidated_pipeline/recovery/`. The
+recovery analytics notebook deliberately omits the Silver `%run` cells, so it does not
+re-run Silver ingestion as a side effect. The production Gold tables were unchanged by
+these runs: `fact_market_trades` remained at version 21, `fact_market_klines` at version
+23, and the Gold AI tables at version 8.
+
+Do not resume `binance_end_to_end` into the production Gold tables until a cutover is
+explicitly approved. The production Gold jobs still full-refresh
+`binance_data.gold_analytics` and `binance_data.gold_ai` in place.
+
+## 8. Known limitations
+
+- The production Gold jobs remain full refresh (`.mode("overwrite")`) and replace the
+  production Gold tables on every run.
+- The recovery Gold jobs also use full refresh, but only inside the
+  `gold_analytics_recovery_v1` and `gold_ai_recovery_v1` schemas.
+- `binance_end_to_end` is paused until the production Gold cutover policy is resolved.
+- Some old production Gold `fact_market_klines` versions were vacuumed at 18:31 on
+  2026-11-01, so a full rollback to the pre-refresh Gold state is not possible.
 - The Airflow monitor checks S3, the checkpoint/file-sink pair, and Kafka lag. It
   does not inspect the Spark container process directly; checkpoint age is the
   query-liveness signal.
