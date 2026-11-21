@@ -9,6 +9,30 @@ Scope: the Kafka to Spark to S3 recovery stream.
 - Source job: `src/streaming/spark_to_s3_recovery.py`
 - Airflow monitor: `binance_streaming_monitor`
 
+## When to use this runbook
+
+Use this document when any of the following happens:
+
+- `binance_streaming_monitor` tasks fail or go stale.
+- Spark streaming stops committing batches or `_spark_metadata` falls behind.
+- Orphan Parquet objects appear in the live output prefix.
+- You are about to restore a checkpoint, switch an output prefix, or clean up orphans.
+- Bronze/Silver trade counts change unexpectedly after a stream restart.
+
+This runbook covers the **Kafka → Spark → S3** path only. Historical and REST ingestion failures are covered in [Ingestion](../pipeline/ingestion.md); downstream transformation issues are covered in [Bronze Layer](../pipeline/bronze_layer.md) and [Silver Layer](../pipeline/silver_layer.md).
+
+### Symptom → section
+
+| Symptom | Go to |
+|---|---|
+| No new Parquet files, S3 freshness task fails | [9.1 No new output](#91-no-new-output) |
+| Checkpoint age too high | [9.2 Stale or stuck checkpoint](#92-stale-or-stuck-checkpoint) |
+| `_spark_metadata` behind commit | [9.3 Checkpoint/file-sink desync](#93-checkpointfile-sink-desync) |
+| Orphan count increased | [5. Orphan Parquet retention and cleanup policy](#5-orphan-parquet-retention-and-cleanup-policy) |
+| Kafka lag high | [9.4 Kafka lag](#94-kafka-lag) |
+| Need to restore from backup | [1](#1-current-verified-backup), [3](#3-backup-procedure-for-future-changes), [4](#4-restore-procedure) |
+| Need to validate a Phase 6-style change | [7](#7-phase-6-validation-snapshot), [9.5 Post-recovery validation](#95-post-recovery-validation) |
+
 Phase 6 switched only the streaming Bronze source. Bronze now reads
 `landing/streaming/trades_recovery/` through the streaming-only run suffix
 `bronze_streaming_recovery_20261101_v1`. The historical/REST checkpoints remain on
@@ -237,3 +261,174 @@ explicitly approved. The production Gold jobs still full-refresh
   does not inspect the Spark container process directly; checkpoint age is the
   query-liveness signal.
 - S3 bucket versioning is not enabled.
+
+## 9. Troubleshooting quick reference
+
+```mermaid
+flowchart TD
+    A["Monitor task failed"] --> B{"Which task?"}
+    B -->|check_streaming_data_in_s3| C["9.1 No new output"]
+    B -->|check_spark_checkpoint_and_file_sink| D{"Commit age or<br/>metadata coverage?"}
+    D -->|stale commit| E["9.2 Stale or stuck checkpoint"]
+    D -->|metadata behind| F["9.3 Checkpoint/file-sink desync"]
+    B -->|check_orphan_files| G["5. Orphan cleanup policy"]
+    B -->|check_kafka_lag| H["9.4 Kafka lag"]
+    C --> I["9.5 Post-recovery validation"]
+    E --> I
+    F --> I
+    G --> I
+    H --> I
+```
+
+### 9.1 No new output
+
+`check_streaming_data_in_s3` fails when the newest Parquet file is older than `STREAMING_FRESHNESS_MINUTES` (default 10) or the prefix has no Parquet files.
+
+Check in this order:
+
+```powershell
+# Is Spark still running?
+docker compose ps spark-streaming
+
+# Are there recent Spark errors?
+docker compose logs --tail=200 spark-streaming
+
+# Is the producer still connected? Look for the process owning the WebSocket,
+# then stop only that process if a restart is needed.
+Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
+  Select-Object ProcessId, CommandLine
+
+# Are new objects arriving?
+aws s3 ls s3://binance-market-data-lake/landing/streaming/trades_recovery/ --recursive |
+  Sort-Object { $_ -replace '.*\s(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*','$1' }
+```
+
+Common causes:
+
+- Producer disconnected and the outer reconnect loop is blocked.
+- `spark-streaming` container stopped or restarting.
+- Kafka topic has no new messages (check `.run/kafka_latest.json` and broker logs).
+- S3 credentials expired or the bucket region is wrong.
+- Spark is reading a different checkpoint than the one being monitored.
+
+Do **not** fix freshness by deleting the checkpoint. A new checkpoint with `startingOffsets=earliest` causes full topic replay; a new checkpoint with `latest` skips data. Both need an explicit decision.
+
+### 9.2 Stale or stuck checkpoint
+
+`check_spark_checkpoint_and_file_sink` fails when the latest commit is older than `STREAMING_CHECKPOINT_FRESHNESS_MINUTES` (default 6).
+
+Inspect the checkpoint:
+
+```powershell
+aws s3 ls s3://binance-market-data-lake/metadata/checkpoints/binance_trades_streaming_v2/commits/ --recursive
+aws s3 ls s3://binance-market-data-lake/metadata/checkpoints/binance_trades_streaming_v2/offsets/ --recursive
+```
+
+Interpretation:
+
+| Observation | Meaning | Action |
+|---|---|---|
+| Commit and offset both frozen | Spark is not processing | Check container logs and Kafka liveness; see [2. Stop the stream before a restore](#2-stop-the-stream-before-a-restore) if intervention is needed |
+| Offset = commit + 1 | One batch in flight | Normal; wait one trigger interval (30 s) |
+| Offset > commit + 1 | Multiple uncommitted batches | Investigate Spark failures; do not edit checkpoint objects |
+| Commit > offset | Corrupt checkpoint | Stop stream, take a fresh backup, then follow [4. Restore procedure](#4-restore-procedure) |
+
+The monitor does not inspect the Spark process directly. A green freshness check means commits are advancing, not that the payload is correct.
+
+### 9.3 Checkpoint/file-sink desync
+
+The same task fails when `_spark_metadata` is behind the latest commit or a batch is missing from metadata coverage.
+
+Inspect metadata:
+
+```powershell
+aws s3 ls s3://binance-market-data-lake/landing/streaming/trades_recovery/_spark_metadata/ --recursive
+aws s3 cp s3://binance-market-data-lake/landing/streaming/trades_recovery/_spark_metadata/79 . --quiet
+```
+
+Rules from [4. Restore procedure](#4-restore-procedure):
+
+- Restore a checkpoint only with its matching `_spark_metadata`.
+- Keep `failOnDataLoss=true`.
+- A `.compact` file is valid coverage for older batches; it does not mean a batch was skipped.
+- Never invent a metadata entry for a batch that did not run. The empty batch 20 repair was valid only because `commits/20` already existed.
+- `_spark_metadata` stores absolute output paths. Moving to a new prefix requires rewriting those paths or starting a new stream with an explicit `startingOffsets` policy.
+
+If file-sink metadata is ahead of or behind the checkpoint by more than one batch, stop writers and take a fresh point-in-time backup before making changes.
+
+### 9.4 Kafka lag
+
+`check_kafka_lag` fails when committed offsets lag latest offsets by more than `KAFKA_MAX_LAG_MESSAGES` (default 5000), when partition sets mismatch, or when lag is negative.
+
+Health file written by `kafka-offset-exporter`:
+
+```powershell
+Get-Content .run\kafka_latest.json
+```
+
+Example shape:
+
+```json
+{"timestamp":"2026-11-21T12:00:00Z","topic":"binance.trades.raw","offsets":"0:12345,1:11987,2:12102"}
+```
+
+Checks:
+
+- File age must be under `KAFKA_HEALTH_FRESHNESS_MINUTES` (default 3). If stale, restart `kafka-offset-exporter`; the monitor depends on this file.
+- Spark committed offsets come from the checkpoint batch at or before the health snapshot time.
+- Partition set must match the broker's topic partitions (3).
+- Negative lag usually means clock/snapshot skew; verify timestamps before changing offsets.
+- Sustained positive lag means Spark throughput is below producer throughput. Check `maxOffsetsPerTrigger`, trigger interval, and container resources.
+
+Never manually commit Kafka offsets to “fix” lag without reconciling Spark checkpoint and file-sink metadata.
+
+### 9.5 Post-recovery validation
+
+After any restart, restore, prefix change, or cleanup:
+
+1. Run the monitor manually and confirm all four tasks pass:
+
+   ```powershell
+   docker compose exec airflow-api-server airflow dags test binance_streaming_monitor
+   ```
+
+2. Confirm checkpoint continuity:
+
+   ```text
+   latest commit <= latest offset <= latest commit + 1
+   ```
+
+3. Confirm `_spark_metadata` covers batches `0..latest commit`, including `.compact` coverage.
+4. Confirm orphan inventory is unchanged or intentionally quarantined:
+
+   ```powershell
+   aws s3 ls s3://binance-market-data-lake/landing/streaming/trades_recovery/ --recursive
+   ```
+
+5. Run Bronze and Silver in Databricks and compare counts against the last validated snapshot:
+   - Bronze raw ≥ Silver unique `(symbol, trade_id)`
+   - Silver count equals `gold_analytics.fact_market_trades` after a successful Gold full refresh
+6. Confirm no new quarantine rows in `silver.quarantine_trades`.
+7. Record the run ID, timestamp, and counts in the incident notes before resuming any paused DAG.
+
+## 10. Escalation checklist
+
+Before asking for a checkpoint restore or Gold cutover approval, provide:
+
+- Failing task name and timestamp
+- Latest checkpoint commit/offset batch IDs and ages
+- Latest `_spark_metadata` batch and any missing batches
+- Orphan count and whether new keys appeared
+- Kafka health file timestamp and per-partition lag
+- `docker compose logs --tail=200 spark-streaming` excerpt
+- Bronze/Silver row counts after the last attempted fix
+- Confirmation that no tracked file or `_spark_metadata` object was deleted
+
+## 11. Related documents
+
+- [Streaming Pipeline](../pipeline/streaming.md)
+- [Bronze Layer](../pipeline/bronze_layer.md)
+- [Silver Layer](../pipeline/silver_layer.md)
+- [Airflow Setup](../deployment/airflow_setup.md)
+- [AWS Setup](../deployment/aws_setup.md)
+

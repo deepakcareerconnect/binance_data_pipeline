@@ -30,7 +30,7 @@ Databricks **SOURCE**-format notebooks (`.py`) for the Binance medallion pipelin
 | `databricks_gold_ai` | `DATABRICKS_GOLD_AI_JOB_ID` | `05.gold_ai_serving` |
 | `databricks_data_quality` | `DATABRICKS_QUALITY_JOB_ID` | `06.data_quality_checks` |
 
-The recovery jobs are documented in `docs/streaming_checkpoint_recovery.md`:
+The recovery jobs are documented in [`docs/troubleshooting/streaming_recovery.md`](../docs/troubleshooting/streaming_recovery.md):
 
 - `binance_gold_analytics_recovery_v1`: job ID `625607989294712`
 - `binance_gold_ai_recovery_v1`: job ID `115647081691022`
