@@ -1,4 +1,6 @@
-# Binance Market Data Pipeline
+# Binance Market Data Engineering Platform
+
+**End-to-End Batch & Streaming ETL Pipeline Using AWS, Apache Kafka, Apache Spark, Databricks, and Apache Airflow**
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![PySpark](https://img.shields.io/badge/PySpark-3.5.6-orange)
@@ -11,12 +13,58 @@
 
 End-to-end data platform for public Binance spot market data. It ingests historical, REST, and real-time WebSocket data into AWS S3, builds a Delta Lake medallion architecture in Databricks, orchestrates and monitors the workflow with Airflow, and exposes curated Gold datasets through a FastAPI market intelligence service.
 
-> Last reviewed: 2026-11-21
+> Last reviewed: 2026-11-22
+
+---
+
+## Problem statement
+
+Cryptocurrency market data is produced continuously by trading activity and is available through very different interfaces: historical monthly and daily kline archives on Binance Vision, REST API snapshots, and real-time trade events over the Binance Spot WebSocket. Each source has a different format, cadence, and failure mode, which creates practical challenges around schema consistency, duplicate records, late or missing data, data freshness, and pipeline recoverability.
+
+Without a structured data engineering pipeline, these feeds remain difficult to organize, validate, and query. Raw files and events need to be landed in a durable store, normalized into common market-data entities, deduplicated and quality-checked, and then modeled into analytical tables that can be consumed reliably. This project addresses that gap with a centralized Binance market data platform built on AWS S3 and a Databricks medallion lakehouse, with Airflow orchestration, streaming health monitoring, and a FastAPI serving layer.
+
+## Project objective
+
+The objective is to design and implement an end-to-end pipeline that ingests, stores, processes, validates, models, monitors, and serves Binance market data:
+
+- Ingest historical `1m` kline ZIP archives from Binance Vision and publish validated, partitioned Parquet files to S3 with deterministic keys, checksums, and audit records.
+- Ingest recent `1m` klines from the Binance REST API for `BTCUSDT`, `ETHUSDT`, and `SOLUSDT`, including validation, checkpointing, quarantine, and idempotent writes.
+- Capture real-time `@trade` events from the Binance Spot WebSocket, publish them to the `binance.trades.raw` Kafka topic, and persist them to S3 with Spark Structured Streaming, checkpointing, and recovery support.
+- Organize raw data in S3 landing prefixes such as `landing/historical`, `landing/rest`, and `landing/streaming`, along with metadata prefixes for checkpoints, audits, and quarantine.
+- Build Databricks Delta tables in a Medallion Architecture: Bronze raw ingestion with Auto Loader, Silver validated and deduplicated trades and klines, and Gold analytics and AI feature tables in Unity Catalog.
+- Model Gold analytics data as a star schema with `dim_date`, `dim_time`, `dim_symbol`, `dim_interval`, `fact_market_klines`, and `fact_market_trades`.
+- Build Gold AI feature tables such as `market_1m`, `market_indicators`, and `market_activity`, and define API-facing serving contracts for asset snapshots, comparisons, market relationships, alerts, and metric definitions.
+- Orchestrate manual historical backfill, hourly end-to-end processing, and 5-minute streaming freshness, checkpoint, orphan-file, and Kafka-lag monitoring with Apache Airflow.
+- Expose selected processed market information through a FastAPI application backed by Databricks SQL.
+
+> Current scope note: the FastAPI market endpoints reference `asset_snapshot`, `asset_comparison`, `market_relationships`, `market_alerts`, and `data_dictionary`. These are documented serving contracts, but the exported notebooks do not currently create all of these tables.
+
+## Why am I doing this project?
+
+I built this project to move beyond isolated scripts and practice designing a complete, production-style data platform. The goal was to connect source ingestion, cloud storage, distributed processing, event streaming, lakehouse modeling, orchestration, and API serving in one repository so that the full data lifecycle could be designed, run, and debugged end to end.
+
+It also gave me hands-on experience with the problems that appear when real pipelines run continuously: duplicate events after restarts, schema changes, checkpoint and offset recovery, handling invalid records through quarantine, validating data across Bronze, Silver, and Gold layers, monitoring freshness and Kafka lag, and keeping an API served from curated Gold datasets. Working through these issues helped me understand that reliability, observability, and data quality are as important as the transformations themselves.
+
+## Business goal
+
+The business goal is to provide a centralized, trustworthy market-data foundation for cryptocurrency analytics and downstream feature engineering. By consolidating historical, REST, and streaming Binance data into a common S3 landing zone and a structured Databricks lakehouse, the platform makes historical and near-real-time market information easier to store, validate, query, and consume.
+
+Specifically, the platform aims to:
+
+- Provide consistent, organized access to Binance trading data for `BTCUSDT`, `ETHUSDT`, and `SOLUSDT`.
+- Support market analysis through curated Silver datasets and a Gold star schema.
+- Support feature-engineering and AI-serving use cases through Gold AI feature tables and API-facing market intelligence endpoints.
+- Improve availability and reliability through automated orchestration, data-quality checks, quarantine, checkpointed recovery, and streaming freshness and lag monitoring.
+- Create a reusable foundation for reporting, market intelligence applications, and future expansion to more symbols, intervals, and data sources.
 
 ---
 
 ## Table of contents
 
+- [Problem statement](#problem-statement)
+- [Project objective](#project-objective)
+- [Why am I doing this project?](#why-am-i-doing-this-project)
+- [Business goal](#business-goal)
 - [What this project does](#what-this-project-does)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Tech stack](#tech-stack)
@@ -58,19 +106,6 @@ The pipeline currently targets three symbols: `BTCUSDT`, `ETHUSDT`, and `SOLUSDT
 *Figure: End-to-end architecture diagram stored in `docs/screenshots/architecture_diagram/`.*
 
 For viewers who prefer a text-rendered diagram, GitHub also renders Mermaid:
-
-```mermaid
-flowchart LR
-    V["Binance Vision"] --> H["Historical batch"] --> S3[("S3 data lake")]
-    R["Binance REST"] --> REST["REST batch"] --> S3
-    W["Binance WebSocket"] --> K["Kafka"] --> SP["Spark Streaming"] --> S3
-    S3 --> DBX["Databricks<br/>Bronze → Silver → Gold"]
-    AF["Airflow"] --> REST
-    AF --> DBX
-    AF --> MON["Streaming monitor"]
-    MON --> S3
-    DBX --> API["FastAPI"]
-```
 
 | Layer | Components | Responsibility |
 |---|---|---|
